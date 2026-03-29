@@ -1,4 +1,5 @@
 import { Octokit } from "octokit";
+import { getOrCreateOrganization, canReviewPR, incrementReviewCount, logReview } from "../supabase/organizations";
 
 export async function handlePullRequestEvent(payload: any) {
   const action = payload.action;
@@ -17,6 +18,22 @@ export async function handlePullRequestEvent(payload: any) {
   // We only care about newly opened or synchronized (updated) PRs
   if (!["opened", "synchronize"].includes(action)) {
     return { status: "ignored", reason: "Action not supported" };
+  }
+
+  const installationId = payload.installation?.id;
+  if (!installationId) {
+    return { status: "ignored", reason: "No GitHub App installation ID found" };
+  }
+
+  // 1. Ensure Organization exists in Supabase
+  const org = await getOrCreateOrganization(installationId, repo.owner.login);
+
+  // 2. Enforce Monthly Limits (5 for Free, 100 for Pro)
+  const isAllowed = await canReviewPR(org);
+  if (!isAllowed) {
+    console.log(`Rate limit exceeded for ${repo.full_name} (${org.plan_tier} tier)`);
+    await logReview(org.id, repo.full_name, pr.number, "rate_limited");
+    return { status: "rate_limited", reason: "Monthly PR review quota exceeded." };
   }
 
   console.log(`Processing PR #${pr.number} in ${repo.full_name}`);
@@ -57,6 +74,12 @@ export async function handlePullRequestEvent(payload: any) {
     );
 
     console.log(`Successfully reviewed PR #${pr.number}`);
+    
+    // 4. Update Database Usage Metrics
+    await incrementReviewCount(org.id);
+    // Rough estimate of tokens for logs (actual tracking would pull from the Anthropic response headers)
+    await logReview(org.id, repo.full_name, pr.number, "success", diff.length / 4);
+
     return { status: "success", reviewLength: reviewMarkdown.length };
 
   } catch (error) {
